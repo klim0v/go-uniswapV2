@@ -7,56 +7,123 @@ import (
 )
 
 const minimumLiquidity int64 = 1000
-const addressZero Address = "addressZero"
 
-type pairKey struct {
-	tokenA, tokenB Token
-}
-type Service struct {
-	muPairs sync.RWMutex
-	pairs   map[pairKey]*Pair
-	Pairs   []*Pair
-}
-
-func (s *Service) allPairsLength() int {
-	s.muPairs.RLock()
-	defer s.muPairs.RUnlock()
-	return len(s.Pairs)
-}
-
-func (s *Service) Pair(tokenA, tokenB Token) *Pair {
-	s.muPairs.RLock()
-	defer s.muPairs.RUnlock()
-	return s.pairs[pairKey{tokenA: tokenA, tokenB: tokenB}]
-}
-
-type Token uint32
+type Token int32
 type Address string
 
-func New() *Service {
-	return &Service{pairs: map[pairKey]*Pair{}}
+const addressZero Address = ""
+
+type Swap struct {
+	muPairs         sync.RWMutex
+	pairs           map[pairKey]*Pair
+	keyPairs        []pairKey
+	isDirtyKeyPairs bool
 }
 
-type Pair struct {
-	mu sync.RWMutex
-	pairKey
-	reserve0, reserve1 *big.Int
-	TotalSupply        *big.Int
-	balances           map[Address]*big.Int
+func New() *Swap {
+	return &Swap{pairs: map[pairKey]*Pair{}}
+}
+
+var mainPrefix = "p"
+
+type balance struct {
+	address   Address
+	liquidity *big.Int
+}
+
+type pairData struct {
+	*sync.RWMutex
+	reserve0    *big.Int
+	reserve1    *big.Int
+	totalSupply *big.Int
+}
+
+func (pd *pairData) TotalSupply() *big.Int {
+	pd.RLock()
+	defer pd.RUnlock()
+	return pd.totalSupply
+}
+
+func (pd *pairData) Reserves() (reserve0 *big.Int, reserve1 *big.Int) {
+	pd.RLock()
+	defer pd.RUnlock()
+	return pd.reserve0, pd.reserve1
+}
+
+func (pd *pairData) Revert() pairData {
+	return pairData{
+		RWMutex:     pd.RWMutex,
+		reserve0:    pd.reserve1,
+		reserve1:    pd.reserve0,
+		totalSupply: pd.totalSupply,
+	}
+}
+
+func (s *Swap) Pairs() ([]pairKey, error) {
+	s.muPairs.Lock()
+	defer s.muPairs.Unlock()
+
+	return s.keyPairs, nil
+}
+
+func (s *Swap) pair(key pairKey) (*Pair, bool) {
+	if key.isSorted() {
+		pair, ok := s.pairs[key]
+		return pair, ok
+	}
+	pair, ok := s.pairs[key.sort()]
+	if !ok {
+		return nil, false
+	}
+	return &Pair{
+		muBalance: pair.muBalance,
+		pairData:  pair.pairData.Revert(),
+		balances:  pair.balances,
+		dirty:     pair.dirty,
+	}, true
+}
+
+func (s *Swap) Pair(coinA, coinB Token) *Pair {
+	s.muPairs.Lock()
+	defer s.muPairs.Unlock()
+
+	key := pairKey{TokenA: coinA, TokenB: coinB}
+	pair, _ := s.pair(key)
+	return pair
+}
+
+type pairKey struct {
+	TokenA, TokenB Token
+}
+
+func (pk pairKey) sort() pairKey {
+	if pk.isSorted() {
+		return pk
+	}
+	return pk.Revert()
+}
+
+func (pk pairKey) isSorted() bool {
+	return pk.TokenA < pk.TokenB
+}
+
+func (pk pairKey) Revert() pairKey {
+	return pairKey{TokenA: pk.TokenB, TokenB: pk.TokenA}
 }
 
 var (
-	IdenticalAddressesError = errors.New("IDENTICAL_ADDRESSES")
-	PairExistsError         = errors.New("PAIR_EXISTS")
+	ErrorIdenticalAddresses = errors.New("IDENTICAL_ADDRESSES")
+	ErrorPairExists         = errors.New("PAIR_EXISTS")
 )
 
-func (s *Service) CreatePair(tokenA, tokenB Token) (*Pair, error) {
-	if tokenA == tokenB {
-		return nil, IdenticalAddressesError
+func (s *Swap) CreatePair(coinA, coinB Token) (*Pair, error) {
+	if coinA == coinB {
+		return nil, ErrorIdenticalAddresses
 	}
 
-	if s.Pair(tokenA, tokenB) != nil {
-		return nil, PairExistsError
+	pair := s.Pair(coinA, coinB)
+	if pair != nil {
+		return nil, ErrorPairExists
 	}
 
 	totalSupply, reserve0, reserve1, balances := big.NewInt(0), big.NewInt(0), big.NewInt(0), map[Address]*big.Int{}
@@ -64,59 +131,81 @@ func (s *Service) CreatePair(tokenA, tokenB Token) (*Pair, error) {
 	s.muPairs.Lock()
 	defer s.muPairs.Unlock()
 
-
-	key := pairKey{
-		tokenA: tokenA,
-		tokenB: tokenB,
+	key := pairKey{coinA, coinB}
+	pair = s.addPair(key, pairData{reserve0: reserve0, reserve1: reserve1, totalSupply: totalSupply}, balances)
+	s.addKeyPair(key)
+	if !key.isSorted() {
+		return &Pair{
+			muBalance: pair.muBalance,
+			pairData:  pair.Revert(),
+			balances:  pair.balances,
+			dirty:     pair.dirty,
+		}, nil
 	}
-	pair := &Pair{
-		pairKey:     key,
-		reserve0:    reserve0,
-		reserve1:    reserve1,
-		TotalSupply: totalSupply,
-		balances:    balances,
-	}
-	s.pairs[key] = pair
-
-	reverseKey := pairKey{
-		tokenA: tokenB,
-		tokenB: tokenA,
-	}
-	s.pairs[reverseKey] = &Pair{
-		pairKey:     reverseKey,
-		reserve0:    reserve1,
-		reserve1:    reserve0,
-		TotalSupply: totalSupply,
-		balances:    balances,
-	}
-
-	s.Pairs = append(s.Pairs, pair)
-
 	return pair, nil
 }
 
+func (s *Swap) addPair(key pairKey, data pairData, balances map[Address]*big.Int) *Pair {
+	if !key.isSorted() {
+		key.Revert()
+		data = data.Revert()
+	}
+	data.RWMutex = &sync.RWMutex{}
+	pair := &Pair{
+		muBalance: &sync.RWMutex{},
+		pairData:  data,
+		balances:  balances,
+		dirty: &dirty{
+			isDirty:         false,
+			isDirtyBalances: false,
+		},
+	}
+	s.pairs[key] = pair
+	return pair
+}
+
+func (s *Swap) addKeyPair(key pairKey) {
+	s.keyPairs = append(s.keyPairs, key.sort())
+	s.isDirtyKeyPairs = true
+}
+
 var (
-	InsufficientLiquidityMintedError = errors.New("INSUFFICIENT_LIQUIDITY_MINTED")
+	ErrorInsufficientLiquidityMinted = errors.New("INSUFFICIENT_LIQUIDITY_MINTED")
 )
 
-func (p *Pair) Balance(address Address) (liquidity *big.Int) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.balances[address]
+type dirty struct {
+	isDirty         bool
+	isDirtyBalances bool
 }
-func (p *Pair) Mint(address Address, amount0, amount1 *big.Int) (liquidity *big.Int, err error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+type Pair struct {
+	pairData
+	muBalance *sync.RWMutex
+	balances  map[Address]*big.Int
+	*dirty
+}
 
-	if p.TotalSupply.Sign() == 0 {
+func (p *Pair) Balance(address Address) (liquidity *big.Int) {
+	p.muBalance.RLock()
+	defer p.muBalance.RUnlock()
+
+	balance := p.balances[address]
+	if balance == nil {
+		return nil
+	}
+
+	return new(big.Int).Set(balance)
+}
+
+func (p *Pair) Mint(address Address, amount0, amount1 *big.Int) (liquidity *big.Int, err error) {
+	if p.TotalSupply().Sign() == 0 {
 		liquidity = startingSupply(amount0, amount1)
 		if liquidity.Sign() != 1 {
-			return nil, InsufficientLiquidityMintedError
+			return nil, ErrorInsufficientLiquidityMinted
 		}
 		p.mint(addressZero, big.NewInt(minimumLiquidity))
 	} else {
-		liquidity := new(big.Int).Div(new(big.Int).Mul(p.TotalSupply, amount0), p.reserve0)
-		liquidity1 := new(big.Int).Div(new(big.Int).Mul(p.TotalSupply, amount1), p.reserve1)
+		liquidity := new(big.Int).Div(new(big.Int).Mul(p.totalSupply, amount0), p.reserve0)
+		liquidity1 := new(big.Int).Div(new(big.Int).Mul(p.totalSupply, amount1), p.reserve1)
 		if liquidity.Cmp(liquidity1) == 1 {
 			liquidity = liquidity1
 		}
@@ -124,31 +213,28 @@ func (p *Pair) Mint(address Address, amount0, amount1 *big.Int) (liquidity *big.
 
 	p.mint(address, liquidity)
 	p.update(amount0, amount1)
-	// todo: kLast: if (feeOn) kLast = uint(reserve0).mul(reserve1); // reserve0 and reserve1 are up-to-date
+
 	return liquidity, nil
 }
 
 var (
-	InsufficientLiquidityBurnedError = errors.New("INSUFFICIENT_LIQUIDITY_BURNED")
+	ErrorInsufficientLiquidityBurned = errors.New("INSUFFICIENT_LIQUIDITY_BURNED")
 )
 
 func (p *Pair) Burn(address Address, liquidity *big.Int) (amount0 *big.Int, amount1 *big.Int, err error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	balance := p.balances[address]
+	balance := p.Balance(address)
 	if balance == nil {
-		return nil, nil, InsufficientLiquidityBurnedError
+		return nil, nil, ErrorInsufficientLiquidityBurned
 	}
 
 	if liquidity.Cmp(balance) == 1 {
-		return nil, nil, InsufficientLiquidityBurnedError
+		return nil, nil, ErrorInsufficientLiquidityBurned
 	}
 
-	amount0, amount1 = p.amounts(liquidity)
+	amount0, amount1 = p.Amounts(liquidity)
 
 	if amount0.Sign() != 1 || amount1.Sign() != 1 {
-		return nil, nil, InsufficientLiquidityBurnedError
+		return nil, nil, ErrorInsufficientLiquidityBurned
 	}
 
 	p.burn(address, liquidity)
@@ -158,36 +244,35 @@ func (p *Pair) Burn(address Address, liquidity *big.Int) (amount0 *big.Int, amou
 }
 
 var (
-	KError                        = errors.New("K")
-	InsufficientInputAmountError  = errors.New("INSUFFICIENT_INPUT_AMOUNT")
-	InsufficientOutputAmountError = errors.New("INSUFFICIENT_OUTPUT_AMOUNT")
-	InsufficientLiquidityError    = errors.New("INSUFFICIENT_LIQUIDITY")
+	ErrorK                        = errors.New("K")
+	ErrorInsufficientInputAmount  = errors.New("INSUFFICIENT_INPUT_AMOUNT")
+	ErrorInsufficientOutputAmount = errors.New("INSUFFICIENT_OUTPUT_AMOUNT")
+	ErrorInsufficientLiquidity    = errors.New("INSUFFICIENT_LIQUIDITY")
 )
 
 func (p *Pair) Swap(amount0In, amount1In, amount0Out, amount1Out *big.Int) (amount0, amount1 *big.Int, err error) {
 	if amount0Out.Sign() != 1 && amount1Out.Sign() != 1 {
-		return nil, nil, InsufficientOutputAmountError
+		return nil, nil, ErrorInsufficientOutputAmount
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	reserve0, reserve1 := p.Reserves()
 
-	if amount0Out.Cmp(p.reserve0) == 1 || amount1Out.Cmp(p.reserve1) == 1 {
-		return nil, nil, InsufficientLiquidityError
+	if amount0Out.Cmp(reserve0) == 1 || amount1Out.Cmp(reserve1) == 1 {
+		return nil, nil, ErrorInsufficientLiquidity
 	}
 
 	amount0 = new(big.Int).Sub(amount0In, amount0Out)
 	amount1 = new(big.Int).Sub(amount1In, amount1Out)
 
 	if amount0.Sign() != 1 && amount1.Sign() != 1 {
-		return nil, nil, InsufficientInputAmountError
+		return nil, nil, ErrorInsufficientInputAmount
 	}
 
-	balance0Adjusted := new(big.Int).Sub(new(big.Int).Mul(new(big.Int).Add(amount0, p.reserve0), big.NewInt(1000)), new(big.Int).Mul(amount0In, big.NewInt(3)))
-	balance1Adjusted := new(big.Int).Sub(new(big.Int).Mul(new(big.Int).Add(amount1, p.reserve1), big.NewInt(1000)), new(big.Int).Mul(amount1In, big.NewInt(3)))
+	balance0Adjusted := new(big.Int).Sub(new(big.Int).Mul(new(big.Int).Add(amount0, reserve0), big.NewInt(1000)), new(big.Int).Mul(amount0In, big.NewInt(3)))
+	balance1Adjusted := new(big.Int).Sub(new(big.Int).Mul(new(big.Int).Add(amount1, reserve1), big.NewInt(1000)), new(big.Int).Mul(amount1In, big.NewInt(3)))
 
-	if new(big.Int).Mul(balance0Adjusted, balance1Adjusted).Cmp(new(big.Int).Mul(new(big.Int).Mul(p.reserve0, p.reserve1), big.NewInt(1000000))) == -1 {
-		return nil, nil, KError
+	if new(big.Int).Mul(balance0Adjusted, balance1Adjusted).Cmp(new(big.Int).Mul(new(big.Int).Mul(reserve0, reserve1), big.NewInt(1000000))) == -1 {
+		return nil, nil, ErrorK
 	}
 
 	p.update(amount0, amount1)
@@ -196,7 +281,15 @@ func (p *Pair) Swap(amount0In, amount1In, amount0Out, amount1Out *big.Int) (amou
 }
 
 func (p *Pair) mint(address Address, value *big.Int) {
-	p.TotalSupply.Add(p.TotalSupply, value)
+	p.pairData.Lock()
+	defer p.pairData.Unlock()
+
+	p.muBalance.Lock()
+	defer p.muBalance.Unlock()
+
+	p.isDirtyBalances = true
+	p.isDirty = true
+	p.totalSupply.Add(p.totalSupply, value)
 	balance := p.balances[address]
 	if balance == nil {
 		p.balances[address] = big.NewInt(0)
@@ -205,24 +298,31 @@ func (p *Pair) mint(address Address, value *big.Int) {
 }
 
 func (p *Pair) burn(address Address, value *big.Int) {
+	p.pairData.Lock()
+	defer p.pairData.Unlock()
+	p.muBalance.Lock()
+	defer p.muBalance.Unlock()
+
+	p.isDirtyBalances = true
+	p.isDirty = true
 	p.balances[address].Sub(p.balances[address], value)
-	p.TotalSupply.Sub(p.TotalSupply, value)
+	p.totalSupply.Sub(p.totalSupply, value)
 }
 
 func (p *Pair) update(amount0, amount1 *big.Int) {
+	p.pairData.Lock()
+	defer p.pairData.Unlock()
+
+	p.isDirty = true
 	p.reserve0.Add(p.reserve0, amount0)
 	p.reserve1.Add(p.reserve1, amount1)
 }
 
 func (p *Pair) Amounts(liquidity *big.Int) (amount0 *big.Int, amount1 *big.Int) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.amounts(liquidity)
-}
-
-func (p *Pair) amounts(liquidity *big.Int) (amount0 *big.Int, amount1 *big.Int) {
-	amount0 = new(big.Int).Div(new(big.Int).Mul(liquidity, p.reserve0), p.TotalSupply)
-	amount1 = new(big.Int).Div(new(big.Int).Mul(liquidity, p.reserve1), p.TotalSupply)
+	p.pairData.RLock()
+	defer p.pairData.RUnlock()
+	amount0 = new(big.Int).Div(new(big.Int).Mul(liquidity, p.reserve0), p.totalSupply)
+	amount1 = new(big.Int).Div(new(big.Int).Mul(liquidity, p.reserve1), p.totalSupply)
 	return amount0, amount1
 }
 

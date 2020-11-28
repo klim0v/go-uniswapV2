@@ -3,6 +3,7 @@ package uniswapV2
 import (
 	"fmt"
 	"math/big"
+	"reflect"
 	"testing"
 )
 
@@ -49,8 +50,8 @@ func TestPair_feeToOff(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if pair.TotalSupply.Cmp(big.NewInt(minimumLiquidity)) != 0 {
-				t.Errorf("liquidity want %s, got %s", big.NewInt(minimumLiquidity), pair.TotalSupply)
+			if pair.TotalSupply().Cmp(big.NewInt(minimumLiquidity)) != 0 {
+				t.Errorf("liquidity want %s, got %s", big.NewInt(minimumLiquidity), pair.TotalSupply())
 			}
 		})
 	}
@@ -102,8 +103,8 @@ func TestPair_Mint(t *testing.T) {
 				t.Errorf("addressZero liquidity want %s, got %s", big.NewInt(minimumLiquidity), pair.balances[addressZero])
 			}
 
-			if pair.TotalSupply.Cmp(tt.expectedLiquidity) != 0 {
-				t.Errorf("total supply want %s, got %s", big.NewInt(minimumLiquidity), pair.TotalSupply)
+			if pair.TotalSupply().Cmp(tt.expectedLiquidity) != 0 {
+				t.Errorf("total supply want %s, got %s", big.NewInt(minimumLiquidity), pair.TotalSupply())
 			}
 		})
 	}
@@ -143,8 +144,8 @@ func TestPair_Swap_token0(t *testing.T) {
 			}
 
 			_, _, err = pair.Swap(tt.swap0Amount, tt.swap1Amount, tt.expected0OutputAmount, new(big.Int).Add(tt.expected1OutputAmount, big.NewInt(1)))
-			if err != KError {
-				t.Fatalf("failed with %v; want error %v", err, KError)
+			if err != ErrorK {
+				t.Fatalf("failed with %v; want error %v", err, ErrorK)
 			}
 
 			amount0, amount1, err := pair.Swap(tt.swap0Amount, tt.swap1Amount, tt.expected0OutputAmount, tt.expected1OutputAmount)
@@ -207,8 +208,8 @@ func TestPair_Swap_token1(t *testing.T) {
 			}
 
 			_, _, err = pair.Swap(tt.swap0Amount, tt.swap1Amount, new(big.Int).Add(tt.expected0OutputAmount, big.NewInt(1)), tt.expected1OutputAmount)
-			if err != KError {
-				t.Fatalf("failed with %v; want error %v", err, KError)
+			if err != ErrorK {
+				t.Fatalf("failed with %v; want error %v", err, ErrorK)
 			}
 			amount0, amount1, err := pair.Swap(tt.swap0Amount, tt.swap1Amount, tt.expected0OutputAmount, tt.expected1OutputAmount)
 			if err != nil {
@@ -291,9 +292,69 @@ func TestPair_Burn(t *testing.T) {
 				t.Errorf("addressZero liquidity want %s, got %s", big.NewInt(minimumLiquidity), pair.balances[addressZero])
 			}
 
-			if pair.TotalSupply.Cmp(big.NewInt(minimumLiquidity)) != 0 {
-				t.Errorf("total supply want %s, got %s", big.NewInt(minimumLiquidity), pair.TotalSupply)
+			if pair.TotalSupply().Cmp(big.NewInt(minimumLiquidity)) != 0 {
+				t.Errorf("total supply want %s, got %s", big.NewInt(minimumLiquidity), pair.TotalSupply())
 			}
 		})
+	}
+}
+
+func TestSwap_Pair_reverseKey(t *testing.T) {
+	service := New()
+	pair := service.Pair(0, 1)
+	if pair != nil {
+		t.Fatal("pair is not nil")
+	}
+	pair, err := service.CreatePair(0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pair == nil {
+		t.Fatal("pair is nil")
+	}
+	pair = service.Pair(0, 1)
+	if pair == nil {
+		t.Fatal("pair is nil")
+	}
+	address := Address("address")
+	liquidity, err := pair.Mint(address, big.NewInt(1e18), big.NewInt(2e18))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if liquidity == nil {
+		t.Error("liquidity is nil")
+	}
+	if !reflect.DeepEqual(liquidity, pair.Balance(address)) {
+		t.Error("liquidities is equal")
+	}
+	reserve0, reserve1 := pair.Reserves()
+	totalSupply := pair.TotalSupply()
+
+	pairReverted := service.Pair(1, 0)
+	if pairReverted == nil {
+		t.Fatal("pairReverted is nil")
+	}
+	reserve0Reverted, reserve1Reverted := pairReverted.Reserves()
+	totalSupplyReverted := pairReverted.TotalSupply()
+
+	if reserve0.Cmp(reserve1Reverted) != 0 {
+		t.Error(reserve0, reserve1Reverted)
+	}
+	if reserve1.Cmp(reserve0Reverted) != 0 {
+		t.Error(reserve1, reserve0Reverted)
+	}
+	if totalSupply.Cmp(totalSupplyReverted) != 0 {
+		t.Error(totalSupply, totalSupplyReverted)
+	}
+	if !reflect.DeepEqual(pair.balances, pairReverted.balances) {
+		t.Error("balances not equal")
+	}
+
+	if pairReverted.isDirty != pair.isDirty {
+		t.Error("isDirty not equal")
+	}
+	pair.isDirty = !pair.isDirty
+	if pairReverted.isDirty != pair.isDirty {
+		t.Error("isDirty not equal")
 	}
 }
