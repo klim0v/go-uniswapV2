@@ -13,15 +13,15 @@ type Address string
 
 const addressZero Address = ""
 
-type Swap struct {
+type UniswapV2 struct {
 	muPairs         sync.RWMutex
 	pairs           map[pairKey]*Pair
 	keyPairs        []pairKey
 	isDirtyKeyPairs bool
 }
 
-func New() *Swap {
-	return &Swap{pairs: map[pairKey]*Pair{}}
+func New() *UniswapV2 {
+	return &UniswapV2{pairs: map[pairKey]*Pair{}}
 }
 
 var mainPrefix = "p"
@@ -59,14 +59,14 @@ func (pd *pairData) Revert() pairData {
 	}
 }
 
-func (s *Swap) Pairs() ([]pairKey, error) {
+func (s *UniswapV2) Pairs() ([]pairKey, error) {
 	s.muPairs.Lock()
 	defer s.muPairs.Unlock()
 
 	return s.keyPairs, nil
 }
 
-func (s *Swap) pair(key pairKey) (*Pair, bool) {
+func (s *UniswapV2) pair(key pairKey) (*Pair, bool) {
 	if key.isSorted() {
 		pair, ok := s.pairs[key]
 		return pair, ok
@@ -83,7 +83,7 @@ func (s *Swap) pair(key pairKey) (*Pair, bool) {
 	}, true
 }
 
-func (s *Swap) Pair(coinA, coinB Token) *Pair {
+func (s *UniswapV2) Pair(coinA, coinB Token) *Pair {
 	s.muPairs.Lock()
 	defer s.muPairs.Unlock()
 
@@ -116,7 +116,7 @@ var (
 	ErrorPairExists         = errors.New("PAIR_EXISTS")
 )
 
-func (s *Swap) CreatePair(coinA, coinB Token) (*Pair, error) {
+func (s *UniswapV2) CreatePair(coinA, coinB Token) (*Pair, error) {
 	if coinA == coinB {
 		return nil, ErrorIdenticalAddresses
 	}
@@ -145,7 +145,7 @@ func (s *Swap) CreatePair(coinA, coinB Token) (*Pair, error) {
 	return pair, nil
 }
 
-func (s *Swap) addPair(key pairKey, data pairData, balances map[Address]*big.Int) *Pair {
+func (s *UniswapV2) addPair(key pairKey, data pairData, balances map[Address]*big.Int) *Pair {
 	if !key.isSorted() {
 		key.Revert()
 		data = data.Revert()
@@ -164,7 +164,7 @@ func (s *Swap) addPair(key pairKey, data pairData, balances map[Address]*big.Int
 	return pair
 }
 
-func (s *Swap) addKeyPair(key pairKey) {
+func (s *UniswapV2) addKeyPair(key pairKey) {
 	s.keyPairs = append(s.keyPairs, key.sort())
 	s.isDirtyKeyPairs = true
 }
